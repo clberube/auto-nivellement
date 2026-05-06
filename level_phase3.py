@@ -16,36 +16,39 @@ try:
 except ImportError:
     cKDTree = None
 
-try:
-    from scipy.ndimage import gaussian_filter
-except ImportError:
-    gaussian_filter = None
 
 # -------------------------- User-editable settings --------------------------
-# INPUT_SHP = Path("output/phase2_leveled_partial_overlap.shp")
-INPUT_SHP = Path("shp/AG_Fusionn_imp.shp")
-OUTPUT_TIF = Path("output/phase3_ag_imp_idw_pre.tif")
+ELEMENT = "Ba"
+ELEMENT_FILE_STEM = ELEMENT.lower()
+INPUT_SHP = Path(f"output/{ELEMENT_FILE_STEM}_phase2_leveled_partial_overlap.shp")
+OUTPUT_TIF = Path(f"output/{ELEMENT_FILE_STEM}_phase3_imp_ordinary_kriging.tif")
 
-VALUE_COLUMN = "Ag_imp"
+VALUE_COLUMN = f"{ELEMENT}_imp"
 PHASE2_STATUS_COLUMN = "P2_STAT"
 FILTER_EXCLUDED_PHASE2_POINTS = True
 PHASE2_EXCLUDED_STATUS_PREFIXES = ("excluded_",)
 
 # Grid settings (in target CRS units, meters if projected)
 TARGET_CRS = None  # e.g. "EPSG:32198"; None => keep projected CRS or auto-UTM
-PIXEL_SIZE = 250.0
+PIXEL_SIZE = 1_000.0
 
-# IDW settings
-# Set AUTO_TUNE_IDW_PARAMS=True to derive parameters from point-spacing statistics.
-AUTO_TUNE_IDW_PARAMS = False
-IDW_POWER = 1.0
-IDW_K_NEIGHBORS = 12
-IDW_MAX_DISTANCE = 20_000.0  # meters; set <=0 for unlimited
-QUERY_CHUNK_SIZE = 100_000
+# Ordinary kriging settings
+# A log transform is usually gentler for positive geochemistry values.
+LOG_TRANSFORM_VALUES = True
+KRIGING_K_NEIGHBORS = 24
+KRIGING_MIN_NEIGHBORS = 0
+KRIGING_MAX_DISTANCE = 5_000.0  # meters; set <=0 for unlimited
+QUERY_CHUNK_SIZE = 10_000
+MAX_GRID_CELLS = 5_000_000
 
-# Optional raster smoothing to reduce point-centric speckles.
-# Set to 0 to disable.
-POST_SMOOTH_SIGMA_PIXELS = 1.0
+# Automatic spherical variogram estimation
+VARIOGRAM_SAMPLE_POINTS = 5_000
+VARIOGRAM_PAIR_COUNT = 80_000
+VARIOGRAM_RANDOM_SEED = 42
+VARIOGRAM_NUGGET_FRACTION = 0.05
+
+# Numerical stabilizer for local kriging systems
+KRIGING_MATRIX_JITTER = 1e-10
 
 # Output settings
 NODATA_VALUE = -9999.0
@@ -66,37 +69,6 @@ def choose_target_crs(gdf: gpd.GeoDataFrame):
             )
         return utm
     return gdf.crs
-
-
-def prepare_points(
-    gdf: gpd.GeoDataFrame,
-) -> tuple[np.ndarray, np.ndarray, gpd.GeoDataFrame]:
-    if VALUE_COLUMN not in gdf.columns:
-        raise KeyError(f"Missing required column: {VALUE_COLUMN}")
-
-    vals = pd.to_numeric(gdf[VALUE_COLUMN], errors="coerce")
-    geom = gdf.geometry
-
-    # Expected input is point samples. For non-point geometries, use representative points.
-    if (geom.geom_type == "Point").all():
-        px = geom.x.to_numpy(dtype=float)
-        py = geom.y.to_numpy(dtype=float)
-    else:
-        reps = geom.representative_point()
-        px = reps.x.to_numpy(dtype=float)
-        py = reps.y.to_numpy(dtype=float)
-
-    mask = np.isfinite(vals.to_numpy(dtype=float)) & np.isfinite(px) & np.isfinite(py)
-    if not np.any(mask):
-        raise ValueError("No finite interpolation points found after filtering.")
-
-    x = px[mask]
-    y = py[mask]
-    z = vals.to_numpy(dtype=float)[mask]
-    # `mask` is positional; use iloc to avoid label-based KeyError on non-default indexes.
-    clean = gdf.iloc[np.flatnonzero(mask)].copy()
-
-    return np.column_stack([x, y]), z, clean
 
 
 def filter_phase2_excluded_points(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -129,6 +101,54 @@ def filter_phase2_excluded_points(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return kept
 
 
+def prepare_points(
+    gdf: gpd.GeoDataFrame,
+) -> tuple[np.ndarray, np.ndarray, gpd.GeoDataFrame]:
+    if VALUE_COLUMN not in gdf.columns:
+        raise KeyError(f"Missing required column: {VALUE_COLUMN}")
+
+    vals = pd.to_numeric(gdf[VALUE_COLUMN], errors="coerce").to_numpy(dtype=float)
+    geom = gdf.geometry
+
+    # Expected input is point samples. For non-point geometries, use representative points.
+    if (geom.geom_type == "Point").all():
+        px = geom.x.to_numpy(dtype=float)
+        py = geom.y.to_numpy(dtype=float)
+    else:
+        reps = geom.representative_point()
+        px = reps.x.to_numpy(dtype=float)
+        py = reps.y.to_numpy(dtype=float)
+
+    mask = np.isfinite(vals) & np.isfinite(px) & np.isfinite(py)
+    if LOG_TRANSFORM_VALUES:
+        mask &= vals > 0
+    if not np.any(mask):
+        raise ValueError("No finite interpolation points found after filtering.")
+
+    clean = gdf.iloc[np.flatnonzero(mask)].copy()
+    points = np.column_stack([px[mask], py[mask]])
+    values = vals[mask]
+
+    if LOG_TRANSFORM_VALUES:
+        values = np.log(values)
+        print("Using natural-log transformed values for kriging.")
+
+    points, values = aggregate_duplicate_points(points, values)
+    return points, values, clean
+
+
+def aggregate_duplicate_points(
+    points_xy: np.ndarray,
+    values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    df = pd.DataFrame({"x": points_xy[:, 0], "y": points_xy[:, 1], "z": values})
+    grouped = df.groupby(["x", "y"], sort=False, as_index=False)["z"].mean()
+    removed = len(df) - len(grouped)
+    if removed:
+        print(f"Aggregated {removed} duplicate-coordinate samples by mean value.")
+    return grouped[["x", "y"]].to_numpy(dtype=float), grouped["z"].to_numpy(dtype=float)
+
+
 def compute_grid(bounds: tuple[float, float, float, float]) -> tuple[int, int, object]:
     minx, miny, maxx, maxy = bounds
     if not np.isfinite([minx, miny, maxx, maxy]).all():
@@ -138,157 +158,197 @@ def compute_grid(bounds: tuple[float, float, float, float]) -> tuple[int, int, o
 
     ncols = int(math.ceil((maxx - minx) / PIXEL_SIZE))
     nrows = int(math.ceil((maxy - miny) / PIXEL_SIZE))
+    total_cells = nrows * ncols
+    if total_cells > MAX_GRID_CELLS:
+        raise ValueError(
+            f"Grid would contain {total_cells:,} cells at PIXEL_SIZE={PIXEL_SIZE:g}. "
+            f"Increase PIXEL_SIZE or MAX_GRID_CELLS before running kriging."
+        )
     transform = from_origin(minx, maxy, PIXEL_SIZE, PIXEL_SIZE)
     return nrows, ncols, transform
 
 
-def idw_predict_chunk(
-    tree: cKDTree,
-    values: np.ndarray,
-    query_points: np.ndarray,
-    idw_power: float,
-    idw_k_neighbors: int,
-    idw_max_distance: float,
+def spherical_semivariogram(
+    distance: np.ndarray,
+    *,
+    nugget: float,
+    sill: float,
+    range_: float,
 ) -> np.ndarray:
-    k = max(1, int(idw_k_neighbors))
-    dist_upper = float(idw_max_distance) if idw_max_distance > 0 else np.inf
-
-    dist, ind = tree.query(query_points, k=k, distance_upper_bound=dist_upper)
-
-    if k == 1:
-        dist = dist[:, None]
-        ind = ind[:, None]
-
-    valid = np.isfinite(dist)
-    out = np.full(query_points.shape[0], np.nan, dtype=float)
-
-    any_valid = valid.any(axis=1)
-    if not np.any(any_valid):
-        return out
-
-    # Exact hits take the exact sampled value.
-    zero_mask = valid & (dist == 0.0)
-    exact_rows = zero_mask.any(axis=1)
-    if np.any(exact_rows):
-        zr = np.where(exact_rows)[0]
-        zc = np.argmax(zero_mask[zr], axis=1)
-        out[zr] = values[ind[zr, zc]]
-
-    # For remaining rows, use weighted average of finite neighbors.
-    rem = (~exact_rows) & any_valid
-    if np.any(rem):
-        d = dist[rem]
-        ii = ind[rem]
-        v = valid[rem]
-
-        w = np.zeros_like(d, dtype=float)
-        w[v] = 1.0 / np.power(d[v], idw_power)
-
-        # tree.query uses index == len(values) for invalid neighbors.
-        padded_values = np.concatenate([values, np.array([0.0], dtype=float)])
-        z = padded_values[ii]
-
-        num = np.sum(w * z, axis=1)
-        den = np.sum(w, axis=1)
-
-        good = den > 0
-        pred = np.full(rem.sum(), np.nan, dtype=float)
-        pred[good] = num[good] / den[good]
-        out[rem] = pred
-
-    return out
+    h = np.asarray(distance, dtype=float)
+    hr = np.clip(h / max(range_, 1e-12), 0.0, None)
+    partial_sill = max(sill - nugget, 0.0)
+    gamma = np.where(
+        h <= 0,
+        0.0,
+        np.where(
+            hr < 1.0,
+            nugget + partial_sill * (1.5 * hr - 0.5 * hr**3),
+            sill,
+        ),
+    )
+    return gamma
 
 
-def auto_tune_idw_params(
-    tree: cKDTree,
+def estimate_spherical_variogram(
     points_xy: np.ndarray,
-) -> tuple[float, int, float]:
-    n = points_xy.shape[0]
-    if n < 10:
-        return IDW_POWER, max(3, min(IDW_K_NEIGHBORS, n)), IDW_MAX_DISTANCE
+    values: np.ndarray,
+) -> tuple[float, float, float]:
+    rng = np.random.default_rng(VARIOGRAM_RANDOM_SEED)
+    n = len(values)
+    if n < 3:
+        raise ValueError("At least 3 points are required for ordinary kriging.")
 
-    # Nearest-neighbor spacing (excluding self).
-    d2, _ = tree.query(points_xy, k=2)
-    nn = d2[:, 1]
-    nn = nn[np.isfinite(nn) & (nn > 0)]
-    if nn.size == 0:
-        return IDW_POWER, IDW_K_NEIGHBORS, IDW_MAX_DISTANCE
+    sample_n = min(n, int(VARIOGRAM_SAMPLE_POINTS))
+    sample_idx = rng.choice(n, size=sample_n, replace=False)
+    pts = points_xy[sample_idx]
+    vals = values[sample_idx]
 
-    p10, p50, p90 = np.quantile(nn, [0.10, 0.50, 0.90])
-    hetero_ratio = float(p90 / max(p10, 1e-9))
+    pair_count = min(int(VARIOGRAM_PAIR_COUNT), sample_n * max(sample_n - 1, 1) // 2)
+    i = rng.integers(0, sample_n, size=pair_count)
+    j = rng.integers(0, sample_n, size=pair_count)
+    keep = i != j
+    i = i[keep]
+    j = j[keep]
 
-    # Higher heterogeneity => use more neighbors and lower power for smoother fields.
-    if hetero_ratio < 2.0:
-        k_auto = 16
-        power_auto = 1.6
-    elif hetero_ratio < 4.0:
-        k_auto = 22
-        power_auto = 1.4
-    elif hetero_ratio < 8.0:
-        k_auto = 28
-        power_auto = 1.25
+    distances = np.linalg.norm(pts[i] - pts[j], axis=1)
+    semivariance = 0.5 * (vals[i] - vals[j]) ** 2
+    keep = np.isfinite(distances) & np.isfinite(semivariance) & (distances > 0)
+    distances = distances[keep]
+    semivariance = semivariance[keep]
+    if distances.size == 0:
+        raise ValueError("Could not estimate a variogram from the input points.")
+
+    sill = float(np.nanvar(values))
+    if not np.isfinite(sill) or sill <= 0:
+        raise ValueError("Input values have no variance; kriging cannot be fit.")
+
+    nugget = float(np.nanquantile(semivariance, 0.05))
+    nugget = float(np.clip(nugget, 0.0, VARIOGRAM_NUGGET_FRACTION * sill))
+
+    target_semivar = nugget + 0.95 * max(sill - nugget, 0.0)
+    order = np.argsort(distances)
+    sorted_dist = distances[order]
+    sorted_semivar = semivariance[order]
+    reached = sorted_dist[sorted_semivar >= target_semivar]
+    if reached.size:
+        range_ = float(np.nanquantile(reached, 0.10))
     else:
-        k_auto = 36
-        power_auto = 1.1
-
-    # Scale k slightly with dataset size but cap for runtime.
-    if n > 500_000:
-        k_auto += 8
-    elif n > 200_000:
-        k_auto += 4
-    k_auto = int(np.clip(k_auto, 12, 48))
-    k_auto = int(min(k_auto, n - 1))
-
-    # Max distance based on k-neighbor reach in sparse zones, with a generous floor.
-    dk, _ = tree.query(points_xy, k=k_auto + 1)
-    d_k = dk[:, -1]
-    d_k = d_k[np.isfinite(d_k) & (d_k > 0)]
-    if d_k.size == 0:
-        max_dist_auto = float(max(IDW_MAX_DISTANCE, 6.0 * p50))
-    else:
-        max_dist_auto = float(np.quantile(d_k, 0.99))
-        max_dist_auto = max(max_dist_auto, 6.0 * float(p50))
+        range_ = float(np.nanquantile(distances, 0.80))
+    if not np.isfinite(range_) or range_ <= 0:
+        range_ = float(np.nanmedian(distances))
 
     print(
-        "Auto-tuned IDW from point spacing: "
-        f"n={n}, nn_p10={p10:.3g}, nn_p50={p50:.3g}, nn_p90={p90:.3g}, "
-        f"heterogeneity_ratio={hetero_ratio:.3g}, "
-        f"power={power_auto:.3g}, k={k_auto}, max_distance={max_dist_auto:.3g}"
+        "Estimated spherical variogram: "
+        f"sample_points={sample_n}, pairs={distances.size}, "
+        f"nugget={nugget:.6g}, sill={sill:.6g}, range={range_:.6g}"
     )
-    return power_auto, k_auto, max_dist_auto
+    return nugget, sill, range_
 
 
-def smooth_raster_ignore_nodata(
-    raster: np.ndarray,
-    nodata_value: float,
-    sigma_pixels: float,
+def ordinary_kriging_predict_one(
+    query_xy: np.ndarray,
+    neighbor_xy: np.ndarray,
+    neighbor_values: np.ndarray,
+    *,
+    nugget: float,
+    sill: float,
+    range_: float,
+) -> float:
+    n = len(neighbor_values)
+    if n == 0:
+        return np.nan
+    if n == 1:
+        return float(neighbor_values[0])
+
+    neighbor_dist = np.linalg.norm(
+        neighbor_xy[:, None, :] - neighbor_xy[None, :, :],
+        axis=2,
+    )
+    query_dist = np.linalg.norm(neighbor_xy - query_xy[None, :], axis=1)
+
+    matrix = np.empty((n + 1, n + 1), dtype=float)
+    matrix[:n, :n] = spherical_semivariogram(
+        neighbor_dist,
+        nugget=nugget,
+        sill=sill,
+        range_=range_,
+    )
+    matrix[:n, n] = 1.0
+    matrix[n, :n] = 1.0
+    matrix[n, n] = 0.0
+    matrix[:n, :n] += np.eye(n) * KRIGING_MATRIX_JITTER
+
+    rhs = np.empty(n + 1, dtype=float)
+    rhs[:n] = spherical_semivariogram(
+        query_dist,
+        nugget=nugget,
+        sill=sill,
+        range_=range_,
+    )
+    rhs[n] = 1.0
+
+    try:
+        weights = np.linalg.solve(matrix, rhs)[:n]
+    except np.linalg.LinAlgError:
+        weights = np.linalg.lstsq(matrix, rhs, rcond=None)[0][:n]
+
+    return float(np.dot(weights, neighbor_values))
+
+
+def ordinary_kriging_predict_chunk(
+    tree: cKDTree,
+    points_xy: np.ndarray,
+    values: np.ndarray,
+    query_points: np.ndarray,
+    *,
+    nugget: float,
+    sill: float,
+    range_: float,
 ) -> np.ndarray:
-    if sigma_pixels <= 0:
-        return raster
-    if gaussian_filter is None:
-        print("scipy.ndimage not available; skipping raster smoothing.")
-        return raster
+    k = max(1, int(KRIGING_K_NEIGHBORS))
+    k = min(k, len(values))
+    dist_upper = float(KRIGING_MAX_DISTANCE) if KRIGING_MAX_DISTANCE > 0 else np.inf
 
-    valid = raster != nodata_value
-    if not np.any(valid):
-        return raster
+    distances, indices = tree.query(query_points, k=k, distance_upper_bound=dist_upper)
+    if k == 1:
+        distances = distances[:, None]
+        indices = indices[:, None]
 
-    data = np.where(valid, raster, 0.0).astype(np.float64)
-    weight = valid.astype(np.float64)
+    out = np.full(query_points.shape[0], np.nan, dtype=float)
+    for row_idx in range(query_points.shape[0]):
+        valid = np.isfinite(distances[row_idx]) & (indices[row_idx] < len(values))
+        if int(np.sum(valid)) < KRIGING_MIN_NEIGHBORS:
+            continue
 
-    data_s = gaussian_filter(data, sigma=sigma_pixels, mode="nearest")
-    weight_s = gaussian_filter(weight, sigma=sigma_pixels, mode="nearest")
+        # Exact hits take the exact sampled value.
+        exact = valid & (distances[row_idx] == 0.0)
+        if np.any(exact):
+            out[row_idx] = values[indices[row_idx][np.flatnonzero(exact)[0]]]
+            continue
 
-    out = np.full_like(raster, nodata_value, dtype=np.float32)
-    good = valid & (weight_s > 1e-9)
-    out[good] = (data_s[good] / weight_s[good]).astype(np.float32)
+        ii = indices[row_idx][valid]
+        out[row_idx] = ordinary_kriging_predict_one(
+            query_points[row_idx],
+            points_xy[ii],
+            values[ii],
+            nugget=nugget,
+            sill=sill,
+            range_=range_,
+        )
     return out
+
+
+def back_transform(values: np.ndarray) -> np.ndarray:
+    if not LOG_TRANSFORM_VALUES:
+        return values
+    return np.exp(values)
 
 
 def run_interpolation() -> None:
     if cKDTree is None:
         raise ImportError(
-            "scipy is required for phase 3 interpolation (cKDTree). "
+            "scipy is required for phase 3 ordinary kriging (cKDTree). "
             "Install scipy and rerun."
         )
 
@@ -306,30 +366,17 @@ def run_interpolation() -> None:
         print(f"Using CRS: {target_crs}")
 
     pts_xy, vals, clean = prepare_points(gdf)
-    print(f"Interpolation points: {len(vals)}")
+    print(f"Kriging points: {len(vals)}")
 
     nrows, ncols, transform = compute_grid(tuple(clean.total_bounds))
     total_cells = nrows * ncols
     print(f"Grid: {nrows} x {ncols} ({total_cells} cells), pixel={PIXEL_SIZE}")
 
+    nugget, sill, range_ = estimate_spherical_variogram(pts_xy, vals)
     tree = cKDTree(pts_xy)
-    if AUTO_TUNE_IDW_PARAMS:
-        idw_power, idw_k_neighbors, idw_max_distance = auto_tune_idw_params(
-            tree,
-            pts_xy,
-        )
-    else:
-        idw_power = float(IDW_POWER)
-        idw_k_neighbors = int(IDW_K_NEIGHBORS)
-        idw_max_distance = float(IDW_MAX_DISTANCE)
-        print(
-            "Using manual IDW parameters: "
-            f"power={idw_power:.3g}, k={idw_k_neighbors}, max_distance={idw_max_distance:.3g}"
-        )
-
     raster_flat = np.full(total_cells, NODATA_VALUE, dtype=np.float32)
 
-    progress = make_progress(total_cells, "Phase 3 interpolation", unit="cell")
+    progress = make_progress(total_cells, "Phase 3 ordinary kriging", unit="cell")
 
     minx, miny, maxx, maxy = clean.total_bounds
     for start in range(0, total_cells, QUERY_CHUNK_SIZE):
@@ -342,14 +389,16 @@ def run_interpolation() -> None:
         yq = maxy - (row + 0.5) * PIXEL_SIZE
         qpts = np.column_stack([xq, yq])
 
-        pred = idw_predict_chunk(
+        pred = ordinary_kriging_predict_chunk(
             tree,
+            pts_xy,
             vals,
             qpts,
-            idw_power=idw_power,
-            idw_k_neighbors=idw_k_neighbors,
-            idw_max_distance=idw_max_distance,
+            nugget=nugget,
+            sill=sill,
+            range_=range_,
         )
+        pred = back_transform(pred)
         chunk = np.where(np.isfinite(pred), pred, NODATA_VALUE).astype(np.float32)
         raster_flat[start:end] = chunk
 
@@ -358,13 +407,6 @@ def run_interpolation() -> None:
     progress.close()
 
     raster = raster_flat.reshape((nrows, ncols))
-    if POST_SMOOTH_SIGMA_PIXELS > 0:
-        print(f"Applying post-smoothing: sigma={POST_SMOOTH_SIGMA_PIXELS} px")
-        raster = smooth_raster_ignore_nodata(
-            raster,
-            nodata_value=NODATA_VALUE,
-            sigma_pixels=POST_SMOOTH_SIGMA_PIXELS,
-        )
 
     OUTPUT_TIF.parent.mkdir(parents=True, exist_ok=True)
     profile = {

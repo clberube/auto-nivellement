@@ -17,13 +17,17 @@ except ImportError:
     tqdm = None
 
 # -------------------------- User-editable settings --------------------------
-INPUT_SHP = Path("shp/AG_Fusionn_imp.shp")
-LOD_REFERENCE_SHP = Path("shp/AG_Fusionn_imp.shp")
+ELEMENT = "Ba"
+ELEMENT_FILE_STEM = ELEMENT.lower()
+INPUT_SHP = Path(f"shp/{ELEMENT.upper()}_Fusionn_imp.shp")
+# Keep this separate from INPUT_SHP so LODs can come from the original full
+# element file even if INPUT_SHP is later changed to a filtered/subset file.
+LOD_REFERENCE_SHP = INPUT_SHP
 OUTPUT_DIR = Path("output")
 
 PROJECT_COLUMN = "NUMR_PROJ_"
-RAW_VALUE_COLUMN = "Ag"
-IMPUTED_VALUE_COLUMN = "Ag_imp"
+RAW_VALUE_COLUMN = ELEMENT
+IMPUTED_VALUE_COLUMN = f"{ELEMENT}_imp"
 CENSORED_COLUMN = "is_censor"
 LITHOLOGY_COLUMN = "CODE_TYPE_"
 
@@ -42,11 +46,11 @@ LINEAR_FIT_MIN_VARIANCE = 1e-16
 
 # Outputs
 SAVE_REGRESSION_PLOTS = True
-REGRESSION_PLOTS_DIRNAME = "phase1_regression_plots"
-FINAL_OUTPUT_NAME = "phase1_leveled_full_overlap.shp"
-LOG_CSV_NAME = "phase1_leveling_log.csv"
-SURVEY_QA_CSV_NAME = "phase1_survey_levelability.csv"
-EXCLUDED_SURVEYS_CSV_NAME = "phase1_excluded_surveys.csv"
+REGRESSION_PLOTS_DIRNAME = f"{ELEMENT_FILE_STEM}_phase1_regression_plots"
+FINAL_OUTPUT_NAME = f"{ELEMENT_FILE_STEM}_phase1_leveled_full_overlap.shp"
+LOG_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase1_leveling_log.csv"
+SURVEY_QA_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase1_survey_levelability.csv"
+EXCLUDED_SURVEYS_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase1_excluded_surveys.csv"
 # ---------------------------------------------------------------------------
 
 

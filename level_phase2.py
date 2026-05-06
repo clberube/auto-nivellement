@@ -10,11 +10,9 @@ import pandas as pd
 from level_core import (
     apply_correction,
     build_project_counts,
-    build_project_footprints,
     build_survey_levelability,
     coerce_numeric_columns,
     fit_correction,
-    is_fully_overlapped,
     make_progress,
     normalize_project_ids,
     pair_values_by_rank,
@@ -26,13 +24,17 @@ from level_core import (
 )
 
 # -------------------------- User-editable settings --------------------------
-INPUT_SHP = Path("output/phase1_leveled_full_overlap.shp")
-LOD_REFERENCE_SHP = Path("shp/AG_Fusionn_imp.shp")
+ELEMENT = "Ba"
+ELEMENT_FILE_STEM = ELEMENT.lower()
 OUTPUT_DIR = Path("output")
+INPUT_SHP = OUTPUT_DIR / f"{ELEMENT_FILE_STEM}_phase1_leveled_full_overlap.shp"
+# Phase 2 reads the phase-1 output, but LOD floors should still come from the
+# original element file where raw censored values are defined.
+LOD_REFERENCE_SHP = Path(f"shp/{ELEMENT.upper()}_Fusionn_imp.shp")
 
 PROJECT_COLUMN = "NUMR_PROJ_"
-RAW_VALUE_COLUMN = "Ag"
-IMPUTED_VALUE_COLUMN = "Ag_imp"
+RAW_VALUE_COLUMN = ELEMENT
+IMPUTED_VALUE_COLUMN = f"{ELEMENT}_imp"
 CENSORED_COLUMN = "is_censor"
 LITHOLOGY_COLUMN = "CODE_TYPE_"
 
@@ -53,7 +55,7 @@ LINEAR_FIT_MIN_VARIANCE = 1e-16
 BUFFER_DISTANCE_KM = 20.0
 PHASE2_START_REFERENCE_PROJECT = "1997520"
 PARTIAL_LEVELING_RATE = 0.3
-MAX_CYCLES = 50
+MAX_CYCLES = 5
 MIN_CYCLE_UPDATES = 1
 RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE = True
 RANDOMIZE_CANDIDATE_ROUTE_PER_CYCLE = True
@@ -63,16 +65,16 @@ SKIP_FULL_OVERLAP_PAIRS = True
 # Outputs
 SAVE_REGRESSION_PLOTS = True
 CLEAR_PLOT_DIR_ON_START = True
-REGRESSION_PLOTS_DIRNAME = "phase2_regression_plots"
-PHASE2_QA_CSV_NAME = "phase2_survey_levelability.csv"
-PHASE2_LOG_CSV_NAME = "phase2_leveling_log.csv"
-PHASE2_EXCLUDED_CSV_NAME = "phase2_excluded_surveys.csv"
-PHASE2_OUTPUT_NAME = "phase2_leveled_partial_overlap.shp"
+REGRESSION_PLOTS_DIRNAME = f"{ELEMENT_FILE_STEM}_phase2_regression_plots"
+PHASE2_QA_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase2_survey_levelability.csv"
+PHASE2_LOG_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase2_leveling_log.csv"
+PHASE2_EXCLUDED_CSV_NAME = f"{ELEMENT_FILE_STEM}_phase2_excluded_surveys.csv"
+PHASE2_OUTPUT_NAME = f"{ELEMENT_FILE_STEM}_phase2_leveled_partial_overlap.shp"
 KEEP_ALL_PHASE2_INPUT_SURVEYS_IN_OUTPUT = True
 
 # Simple output stabilizer for phase 2
 CLIP_PHASE2_VALUES = True
-PHASE2_MAX_PERCENTILE = 99.0
+PHASE2_MAX_PERCENTILE = 99
 # ---------------------------------------------------------------------------
 
 
@@ -90,6 +92,35 @@ def _to_metric_crs(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, str]:
         return gdf_metric, str(metric_crs)
 
     return gdf, str(gdf.crs)
+
+
+def _mask_within_distance(
+    query_geoms: gpd.GeoSeries,
+    target_geoms: gpd.GeoSeries,
+    distance: float,
+) -> np.ndarray:
+    if query_geoms.empty or target_geoms.empty:
+        return np.zeros(len(query_geoms), dtype=bool)
+
+    query_result = target_geoms.sindex.query(
+        query_geoms,
+        predicate="dwithin",
+        distance=distance,
+    )
+    mask = np.zeros(len(query_geoms), dtype=bool)
+    if query_result.size:
+        mask[np.unique(query_result[0])] = True
+    return mask
+
+
+def _all_within_distance(
+    query_geoms: gpd.GeoSeries,
+    target_geoms: gpd.GeoSeries,
+    distance: float,
+) -> bool:
+    if query_geoms.empty or target_geoms.empty:
+        return False
+    return bool(_mask_within_distance(query_geoms, target_geoms, distance).all())
 
 
 def _init_phase2_columns(gdf: gpd.GeoDataFrame) -> None:
@@ -230,13 +261,7 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
         )
 
     gdf_metric, metric_crs_name = _to_metric_crs(gdf)
-    footprints = build_project_footprints(
-        gdf_metric, PROJECT_COLUMN, levelable_projects
-    )
     buffer_m = float(BUFFER_DISTANCE_KM) * 1000.0
-    buffered_footprints = {
-        pid: fp.buffer(buffer_m) for pid, fp in footprints.items() if not fp.is_empty
-    }
 
     project_indices = gdf.groupby(PROJECT_COLUMN, sort=False).indices
     project_positions: dict[str, np.ndarray] = {
@@ -275,7 +300,7 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
         f"reference_route_randomized={RANDOMIZE_REFERENCE_ROUTE_PER_CYCLE}, "
         f"candidate_route_randomized={RANDOMIZE_CANDIDATE_ROUTE_PER_CYCLE}, "
         f"clip_values={CLIP_PHASE2_VALUES}, clip_range=[{lod_floor:.3g}, {clip_max_value:.3g}], "
-        f"metric_crs={metric_crs_name}"
+        f"matching=direct_geometry_buffer, metric_crs={metric_crs_name}"
     )
 
     completed_cycles = 0
@@ -292,10 +317,6 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
             progress.update(1)
 
             if reference_project in excluded_low_unique_values:
-                continue
-            if reference_project not in footprints:
-                continue
-            if reference_project not in buffered_footprints:
                 continue
             if reference_project not in project_positions:
                 continue
@@ -338,7 +359,6 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
                 )
                 continue
 
-            ref_buffer = buffered_footprints[reference_project]
             candidate_rows: list[tuple[str, int, np.ndarray, np.ndarray]] = []
             for candidate in ordered_projects:
                 if candidate == reference_project:
@@ -347,33 +367,21 @@ def run_phase2_leveling(gdf: gpd.GeoDataFrame, survey_qa: pd.DataFrame) -> None:
                     continue
                 if candidate in excluded_low_unique_values:
                     continue
-                if candidate not in footprints:
-                    continue
-                if candidate not in buffered_footprints:
-                    continue
                 if candidate not in project_positions:
                     continue
 
+                cand_geom = project_geoms_metric[candidate]
                 if SKIP_FULL_OVERLAP_PAIRS and (
-                    is_fully_overlapped(
-                        footprints[candidate], footprints[reference_project]
-                    )
-                    or is_fully_overlapped(
-                        footprints[reference_project], footprints[candidate]
-                    )
+                    _all_within_distance(cand_geom, ref_geom, 0.0)
+                    or _all_within_distance(ref_geom, cand_geom, 0.0)
                 ):
                     continue
 
-                if not ref_buffer.intersects(footprints[candidate]):
-                    continue
-
-                cand_buffer = buffered_footprints[candidate]
-                ref_mask = ref_geom.within(cand_buffer).to_numpy(dtype=bool)
+                ref_mask = _mask_within_distance(ref_geom, cand_geom, buffer_m)
                 if not np.any(ref_mask):
                     continue
 
-                cand_geom = project_geoms_metric[candidate]
-                cand_mask = cand_geom.within(ref_buffer).to_numpy(dtype=bool)
+                cand_mask = _mask_within_distance(cand_geom, ref_geom, buffer_m)
                 if not np.any(cand_mask):
                     continue
 
